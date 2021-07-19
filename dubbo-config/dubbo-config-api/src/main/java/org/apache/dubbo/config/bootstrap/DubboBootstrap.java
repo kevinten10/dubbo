@@ -94,12 +94,13 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static java.lang.String.format;
 import static java.util.Collections.singletonList;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
 import static org.apache.dubbo.common.config.ConfigurationUtils.parseProperties;
-import static org.apache.dubbo.common.config.configcenter.DynamicConfiguration.getDynamicConfiguration;
+import static org.apache.dubbo.common.config.configcenter.DynamicConfigurationFactory.getDynamicConfigurationFactory;
 import static org.apache.dubbo.common.constants.CommonConstants.DEFAULT_METADATA_STORAGE_TYPE;
 import static org.apache.dubbo.common.constants.CommonConstants.DUBBO;
 import static org.apache.dubbo.common.constants.CommonConstants.REGISTRY_SPLIT_PATTERN;
@@ -188,6 +189,10 @@ public class DubboBootstrap {
     private final List<CompletableFuture<?>> asyncExportingFutures = new ArrayList<>();
 
     private final List<CompletableFuture<?>> asyncReferringFutures = new ArrayList<>();
+
+    private boolean asyncExportFinish = true;
+
+    private boolean asyncReferFinish = true;
 
     private static boolean ignoreConfigState;
 
@@ -1103,13 +1108,20 @@ public class DubboBootstrap {
             }
 
             referServices();
-            if (asyncExportingFutures.size() > 0 || asyncReferringFutures.size() > 0) {
+
+            // wait async export / refer finish if needed
+            awaitFinish();
+
+            if (isExportBackground() || isReferBackground()) {
                 new Thread(() -> {
-                    try {
-                        this.awaitFinish();
-                    } catch (Exception e) {
-                        logger.warn(NAME + " asynchronous export / refer occurred an exception.");
+                    while (!asyncExportFinish || !asyncReferFinish) {
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException e) {
+                            logger.error(NAME + " waiting async export / refer occurred and error.", e);
+                        }
                     }
+
                     startup.set(true);
                     if (logger.isInfoEnabled()) {
                         logger.info(NAME + " is ready.");
@@ -1161,25 +1173,79 @@ public class DubboBootstrap {
         return this;
     }
 
-    public DubboBootstrap awaitFinish() throws Exception {
-        logger.info(NAME + " waiting services exporting / referring asynchronously...");
-
+    private void waitAsyncExportIfNeeded() {
         if (asyncExportingFutures.size() > 0) {
+            asyncExportFinish = false;
+            if (isExportBackground()) {
+                new Thread(this::waitExportFinish).start();
+            } else {
+                waitExportFinish();
+            }
+        }
+    }
+
+    private boolean isExportBackground() {
+        List<Boolean> list = configManager.getProviders()
+            .stream()
+            .map(ProviderConfig::getExportBackground)
+            .filter(k -> k != null && k)
+            .collect(Collectors.toList());
+
+        return CollectionUtils.isNotEmpty(list);
+    }
+
+    private void waitExportFinish() {
+        try {
+            logger.info(NAME + " waiting services exporting asynchronously...");
             CompletableFuture<?> future = CompletableFuture.allOf(asyncExportingFutures.toArray(new CompletableFuture[0]));
             future.get();
+        } catch (Exception e) {
+            logger.warn(NAME + " asynchronous export occurred an exception.");
+        } finally {
+            executorRepository.shutdownServiceExportExecutor();
+            logger.info(NAME + " asynchronous export finished.");
+            asyncExportFinish = true;
         }
+    }
 
+    private void waitAsyncReferIfNeeded() {
         if (asyncReferringFutures.size() > 0) {
+            asyncReferFinish = false;
+            if (isReferBackground()) {
+                new Thread(this::waitReferFinish).start();
+            } else {
+                waitReferFinish();
+            }
+        }
+    }
+
+    private boolean isReferBackground() {
+        List<Boolean> list = configManager.getConsumers()
+            .stream()
+            .map(ConsumerConfig::getReferBackground)
+            .filter(k -> k != null && k)
+            .collect(Collectors.toList());
+
+        return CollectionUtils.isNotEmpty(list);
+    }
+
+    private void waitReferFinish() {
+        try {
+            logger.info(NAME + " waiting services referring asynchronously...");
             CompletableFuture<?> future = CompletableFuture.allOf(asyncReferringFutures.toArray(new CompletableFuture[0]));
             future.get();
+        } catch (Exception e) {
+            logger.warn(NAME + " asynchronous refer occurred an exception.");
+        } finally {
+            executorRepository.shutdownServiceExportExecutor();
+            logger.info(NAME + " asynchronous refer finished.");
+            asyncReferFinish = true;
         }
+    }
 
-        logger.info("Service asynchronous export / refer finished.");
-
-        // release the resources.
-        logger.info("Shutting down the export-refer executor.");
-        executorRepository.shutdownExportReferExecutor();
-
+    public DubboBootstrap awaitFinish() {
+        waitAsyncExportIfNeeded();
+        waitAsyncReferIfNeeded();
         return this;
     }
 
@@ -1263,6 +1329,19 @@ public class DubboBootstrap {
     }
 
     /**
+     * Get the instance of {@link DynamicConfiguration} by the specified connection {@link URL} of config-center
+     *
+     * @param connectionURL of config-center
+     * @return non-null
+     * @since 2.7.5
+     */
+    private DynamicConfiguration getDynamicConfiguration(URL connectionURL) {
+        String protocol = connectionURL.getProtocol();
+        DynamicConfigurationFactory factory = getDynamicConfigurationFactory(protocol);
+        return factory.getDynamicConfiguration(connectionURL);
+    }
+
+    /**
      * export {@link MetadataService}
      */
     private void exportMetadataService() {
@@ -1285,7 +1364,7 @@ public class DubboBootstrap {
             }
 
             if (sc.shouldExportAsync()) {
-                ExecutorService executor = executorRepository.getExportReferExecutor();
+                ExecutorService executor = executorRepository.getServiceExportExecutor();
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                     try {
                         if (!sc.isExported()) {
@@ -1337,7 +1416,7 @@ public class DubboBootstrap {
 
             if (rc.shouldInit()) {
                 if (rc.shouldReferAsync()) {
-                    ExecutorService executor = executorRepository.getExportReferExecutor();
+                    ExecutorService executor = executorRepository.getServiceReferExecutor();
                     CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                         try {
                             cache.get(rc);
@@ -1389,6 +1468,8 @@ public class DubboBootstrap {
                 ServiceInstanceMetadataUtils.refreshMetadataAndInstance(serviceInstance);
             } catch (Exception e) {
                 logger.error("Refresh instance and metadata error", e);
+            } finally {
+                localMetadataService.releaseBlock();
             }
         }, 0, ConfigurationUtils.get(METADATA_PUBLISH_DELAY_KEY, DEFAULT_METADATA_PUBLISH_DELAY), TimeUnit.MILLISECONDS);
     }
@@ -1528,6 +1609,7 @@ public class DubboBootstrap {
 
     private void destroyMetadataReports() {
         AbstractMetadataReportFactory.destroy();
+        MetadataReportInstance.reset();
         ExtensionLoader.resetExtensionLoader(MetadataReportFactory.class);
     }
 
